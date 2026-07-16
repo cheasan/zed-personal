@@ -60,3 +60,5 @@ crates/docs_preprocessor/actions.json
 .nixos-test-history
 
 .local*
+build.log
+build.exit
