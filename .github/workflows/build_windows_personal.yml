@@ -1,0 +1,128 @@
+name: Build Windows (personal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile"
+        type: choice
+        default: release-fast
+        options:
+          - release-fast
+          - release
+      release_channel:
+        description: "Zed release channel baked into the binary (dev avoids auto-update)"
+        type: choice
+        default: dev
+        options:
+          - dev
+          - preview
+          - stable
+      publish_release:
+        description: "Also publish a GitHub Release with the zip attached"
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-windows-personal-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      # Drop debuginfo: the hosted runner does not have enough disk for Zed's PDBs.
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "false"
+      RELEASE_CHANNEL: ${{ inputs.release_channel }}
+      ZED_RELEASE_CHANNEL: ${{ inputs.release_channel }}
+
+    steps:
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          # Zed's target dir is huge; reclaim space from preinstalled SDKs we don't use.
+          foreach ($dir in @(
+            "$env:ANDROID_HOME",
+            "$env:CHROMEWEBDRIVER",
+            "C:\Program Files (x86)\Android",
+            "C:\Program Files\dotnet",
+            "C:\Program Files\Google\Chrome",
+            "C:\Program Files\MongoDB",
+            "C:\Program Files\PostgreSQL",
+            "C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk",
+            "C:\hostedtoolcache\windows\Ruby",
+            "C:\hostedtoolcache\windows\go",
+            "C:\hostedtoolcache\windows\Python"
+          )) {
+            if ($dir -and (Test-Path $dir)) {
+              Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+            }
+          }
+          Get-PSDrive C | Select-Object Used, Free
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          # rust-toolchain.toml pins the version; `rustup show` installs it.
+          rustup show
+          rustc -Vv
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          # target/ is far bigger than GitHub's 10 GB cache quota — registry only.
+          cache-targets: "false"
+          cache-all-crates: "true"
+
+      - name: Build
+        shell: pwsh
+        run: cargo build --profile ${{ inputs.profile }} --package zed --package cli
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $outDir = "target/${{ inputs.profile }}"
+          $version = (Select-String -Path crates/zed/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $name = "zed-windows-x86_64-$version-$sha"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "$outDir/zed.exe" "dist/$name/zed.exe"
+          Copy-Item "$outDir/cli.exe" "dist/$name/zed-cli.exe"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "zip=dist/$name.zip" >> $env:GITHUB_OUTPUT
+          "tag=win-$version-$sha" >> $env:GITHUB_OUTPUT
+          Get-ChildItem dist -Recurse | Select-Object FullName, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.package.outputs.tag }}"
+          gh release create $tag "${{ steps.package.outputs.zip }}" `
+            --title "Zed Windows $tag" `
+            --notes "Unofficial personal build of ${{ github.sha }} (profile: ${{ inputs.profile }}, channel: ${{ inputs.release_channel }}). Not code signed." `
+            --latest=false
