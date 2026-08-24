@@ -1029,7 +1029,9 @@ impl TerminalBuilder {
             path_style,
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
+            #[cfg(not(target_os = "windows"))]
             palette_change_notifications: false,
+            #[cfg(not(target_os = "windows"))]
             last_reported_appearance: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
@@ -1320,7 +1322,9 @@ impl TerminalBuilder {
                         .unwrap_or_default()
                 },
                 pending_cwd_boundary: None,
+                #[cfg(not(target_os = "windows"))]
                 palette_change_notifications: false,
+                #[cfg(not(target_os = "windows"))]
                 last_reported_appearance: None,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
@@ -1424,7 +1428,10 @@ impl TerminalBuilder {
 
         // Send unsolicited color scheme reports (mode 2031) to applications that
         // subscribed to palette change notifications whenever the theme appearance
-        // changes.
+        // changes. (Not on Windows: ConPTY swallows the CSI ? 996 n query, so we
+        // skip the 2031 protocol entirely and let opencode fall back to the
+        // Windows registry which works correctly.)
+        #[cfg(not(target_os = "windows"))]
         cx.observe_global::<theme::GlobalTheme>(move |this, cx| {
             let appearance = cx.theme().appearance();
             if this.last_reported_appearance == Some(appearance) {
@@ -1508,8 +1515,10 @@ pub struct Terminal {
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
     /// Whether the application requested color palette change notifications (DECSET 2031).
+    #[cfg(not(target_os = "windows"))]
     palette_change_notifications: bool,
     /// The appearance last reported to the application via a mode 2031 report.
+    #[cfg(not(target_os = "windows"))]
     last_reported_appearance: Option<Appearance>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
@@ -1665,20 +1674,31 @@ impl Terminal {
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ColorSchemeQuery => {
-                // As with `ColorRequest` above, this response must be written in order
-                // relative to other PTY writes.
-                let appearance = cx.theme().appearance();
-                self.last_reported_appearance = Some(appearance);
-                self.write_to_pty(Cow::Borrowed(color_scheme_report(appearance).as_bytes()));
-            }
-            TerminalBackendEvent::PaletteChangeNotifications(enabled) => {
-                self.palette_change_notifications = enabled;
-                if enabled {
-                    // Per mode 2031 semantics, immediately report the current scheme
-                    // when notifications are enabled.
+                // On Windows, ConPTY swallows the CSI ? 996 n query, so we never see it.
+                // Skip the response to let opencode fall back to the Windows registry
+                // (AppsUseLightTheme), which works correctly.
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // As with `ColorRequest` above, this response must be written in order
+                    // relative to other PTY writes.
                     let appearance = cx.theme().appearance();
                     self.last_reported_appearance = Some(appearance);
                     self.write_to_pty(Cow::Borrowed(color_scheme_report(appearance).as_bytes()));
+                }
+            }
+            TerminalBackendEvent::PaletteChangeNotifications(_enabled) => {
+                #[cfg(not(target_os = "windows"))]
+                {
+                    self.palette_change_notifications = enabled;
+                    if enabled {
+                        // Per mode 2031 semantics, immediately report the current scheme
+                        // when notifications are enabled.
+                        let appearance = cx.theme().appearance();
+                        self.last_reported_appearance = Some(appearance);
+                        self.write_to_pty(Cow::Borrowed(
+                            color_scheme_report(appearance).as_bytes(),
+                        ));
+                    }
                 }
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
@@ -3800,6 +3820,7 @@ mod tests {
         assert_content_eventually(&terminal, "hello-from-subprocess", cx).await;
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn init_theme_test_terminal(cx: &mut TestAppContext) -> Entity<Terminal> {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -3820,6 +3841,7 @@ mod tests {
         })
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn set_test_theme_appearance(cx: &mut TestAppContext, appearance: Appearance) {
         cx.update(|cx| {
             let mut theme = theme::GlobalTheme::theme(cx).as_ref().clone();
@@ -3828,6 +3850,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_color_scheme_query_response(cx: &mut TestAppContext) {
         let terminal = init_theme_test_terminal(cx);
@@ -3857,6 +3880,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_color_scheme_change_notifications(cx: &mut TestAppContext) {
         let terminal = init_theme_test_terminal(cx);
