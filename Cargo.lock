@@ -607,7 +607,6 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
-source = "git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f#4c129667ce56611becdc82de6e28218c80e2e88f"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
@@ -622,6 +621,7 @@ dependencies = [
  "rustix 1.1.2",
  "rustix-openpty",
  "serde",
+ "serde_json",
  "signal-hook",
  "unicode-width",
  "vte",

@@ -319,6 +319,8 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::Bell => Self::Bell,
             AlacTermEvent::Exit => Self::Exit,
             AlacTermEvent::ChildExit(status) => Self::ChildExit(status),
+            AlacTermEvent::ColorSchemeQuery => Self::ColorSchemeQuery,
+            AlacTermEvent::PaletteChangeMode(enabled) => Self::PaletteChangeNotifications(enabled),
         }
     }
 }

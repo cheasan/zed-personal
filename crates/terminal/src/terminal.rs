@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
-use theme::{ActiveTheme, Theme};
+use theme::{ActiveTheme, Appearance, Theme};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
@@ -735,6 +735,8 @@ pub(crate) enum TerminalBackendEvent {
     Bell,
     Exit,
     ChildExit(ExitStatus),
+    ColorSchemeQuery,
+    PaletteChangeNotifications(bool),
 }
 
 impl fmt::Debug for TerminalBackendEvent {
@@ -753,6 +755,10 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::Bell => f.write_str("Bell"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
+            Self::ColorSchemeQuery => f.write_str("ColorSchemeQuery"),
+            Self::PaletteChangeNotifications(enabled) => {
+                write!(f, "PaletteChangeNotifications({enabled})")
+            }
         }
     }
 }
@@ -1023,6 +1029,8 @@ impl TerminalBuilder {
             path_style,
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
+            palette_change_notifications: false,
+            last_reported_appearance: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
             #[cfg(test)]
@@ -1312,6 +1320,8 @@ impl TerminalBuilder {
                         .unwrap_or_default()
                 },
                 pending_cwd_boundary: None,
+                palette_change_notifications: false,
+                last_reported_appearance: None,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
                 #[cfg(test)]
@@ -1349,7 +1359,7 @@ impl TerminalBuilder {
         cx.background_spawn(fut)
     }
 
-    pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
+    pub fn subscribe(mut self, cx: &mut Context<Terminal>) -> Terminal {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
@@ -1411,6 +1421,23 @@ impl TerminalBuilder {
             }
             anyhow::Ok(())
         });
+
+        // Send unsolicited color scheme reports (mode 2031) to applications that
+        // subscribed to palette change notifications whenever the theme appearance
+        // changes.
+        cx.observe_global::<theme::GlobalTheme>(move |this, cx| {
+            let appearance = cx.theme().appearance();
+            if this.last_reported_appearance == Some(appearance) {
+                return;
+            }
+            let notify = this.palette_change_notifications;
+            this.last_reported_appearance = Some(appearance);
+            if notify {
+                this.write_to_pty(Cow::Borrowed(color_scheme_report(appearance).as_bytes()));
+            }
+        })
+        .detach();
+
         self.terminal
     }
 
@@ -1480,6 +1507,10 @@ pub struct Terminal {
     keyboard_input_sent: bool,
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
+    /// Whether the application requested color palette change notifications (DECSET 2031).
+    palette_change_notifications: bool,
+    /// The appearance last reported to the application via a mode 2031 report.
+    last_reported_appearance: Option<Appearance>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
@@ -1632,6 +1663,23 @@ impl Terminal {
                 let color = self.term.lock().colors()[index]
                     .unwrap_or_else(|| to_vte_rgb(get_color_at_index(index, cx.theme().as_ref())));
                 self.write_to_pty(format(color).into_bytes());
+            }
+            TerminalBackendEvent::ColorSchemeQuery => {
+                // As with `ColorRequest` above, this response must be written in order
+                // relative to other PTY writes.
+                let appearance = cx.theme().appearance();
+                self.last_reported_appearance = Some(appearance);
+                self.write_to_pty(Cow::Borrowed(color_scheme_report(appearance).as_bytes()));
+            }
+            TerminalBackendEvent::PaletteChangeNotifications(enabled) => {
+                self.palette_change_notifications = enabled;
+                if enabled {
+                    // Per mode 2031 semantics, immediately report the current scheme
+                    // when notifications are enabled.
+                    let appearance = cx.theme().appearance();
+                    self.last_reported_appearance = Some(appearance);
+                    self.write_to_pty(Cow::Borrowed(color_scheme_report(appearance).as_bytes()));
+                }
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
                 self.register_task_finished(Some(exit_status), cx);
@@ -3372,6 +3420,15 @@ fn content_index_for_mouse(pos: GpuiPoint<Pixels>, terminal_bounds: &TerminalBou
     clamped_row * terminal_bounds.num_columns() + clamped_col
 }
 
+/// Returns the DECRPM-style color scheme report (mode 2031) for the given appearance:
+/// `CSI ? 997 ; 1 n` for dark and `CSI ? 997 ; 2 n` for light.
+pub fn color_scheme_report(appearance: Appearance) -> &'static str {
+    match appearance {
+        Appearance::Dark => "\x1b[?997;1n",
+        Appearance::Light => "\x1b[?997;2n",
+    }
+}
+
 /// Converts an 8 bit ANSI color to its GPUI equivalent.
 /// Accepts `usize` for compatibility with the `alacritty::Colors` interface,
 /// Other than that use case, should only be called with values in the `[0,255]` range
@@ -3741,6 +3798,104 @@ mod tests {
             Some(ExitStatus::default())
         );
         assert_content_eventually(&terminal, "hello-from-subprocess", cx).await;
+    }
+
+    fn init_theme_test_terminal(cx: &mut TestAppContext) -> Entity<Terminal> {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        })
+    }
+
+    fn set_test_theme_appearance(cx: &mut TestAppContext, appearance: Appearance) {
+        cx.update(|cx| {
+            let mut theme = theme::GlobalTheme::theme(cx).as_ref().clone();
+            theme.appearance = appearance;
+            theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_color_scheme_query_response(cx: &mut TestAppContext) {
+        let terminal = init_theme_test_terminal(cx);
+
+        // The default test theme is dark.
+        terminal.update(cx, |terminal, cx| {
+            terminal.take_pty_write_log();
+            terminal.process_pty_event(PtyEvent::Event(TerminalBackendEvent::ColorSchemeQuery), cx);
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;1n".to_vec()]
+            );
+        });
+
+        set_test_theme_appearance(cx, Appearance::Light);
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, cx| {
+            // Without palette change notifications enabled, no unsolicited report is sent.
+            assert!(terminal.take_pty_write_log().is_empty());
+
+            terminal.process_pty_event(PtyEvent::Event(TerminalBackendEvent::ColorSchemeQuery), cx);
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;2n".to_vec()]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_color_scheme_change_notifications(cx: &mut TestAppContext) {
+        let terminal = init_theme_test_terminal(cx);
+
+        terminal.update(cx, |terminal, cx| {
+            // Enabling notifications immediately reports the current (dark) scheme.
+            terminal.process_pty_event(
+                PtyEvent::Event(TerminalBackendEvent::PaletteChangeNotifications(true)),
+                cx,
+            );
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;1n".to_vec()]
+            );
+        });
+
+        // An appearance change sends an unsolicited report.
+        set_test_theme_appearance(cx, Appearance::Light);
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;2n".to_vec()]
+            );
+        });
+
+        // Disabling notifications stops the unsolicited reports.
+        terminal.update(cx, |terminal, cx| {
+            terminal.process_pty_event(
+                PtyEvent::Event(TerminalBackendEvent::PaletteChangeNotifications(false)),
+                cx,
+            );
+            terminal.take_pty_write_log();
+        });
+        set_test_theme_appearance(cx, Appearance::Dark);
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, _| {
+            assert!(terminal.take_pty_write_log().is_empty());
+        });
     }
 
     fn init_terminal_test(cx: &mut TestAppContext, output: &[u8]) -> Entity<Terminal> {
